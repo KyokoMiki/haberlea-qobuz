@@ -1,0 +1,19 @@
+[build-system]
+requires = ["uv_build"]
+build-backend = "uv_build"
+
+[project]
+name = "haberlea-qobuz"
+version = "0.1.0"
+description = "Qobuz module for Haberlea"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.13.2",
+    "av>=16.0.1",
+    "msgspec>=0.20.0",
+    "mutagen>=1.47.0",
+    "numpy>=2.4.0",
+]
+
+[project.entry-points."haberlea.modules"]
+qobuz = "haberlea_qobuz:module_information"
