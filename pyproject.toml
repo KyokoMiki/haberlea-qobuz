@@ -9,6 +9,7 @@ description = "Qobuz module for Haberlea"
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.13.2",
+    "anyio>=4.12.1",
     "av>=16.0.1",
     "msgspec>=0.20.0",
     "mutagen>=1.47.0",

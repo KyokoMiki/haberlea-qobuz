@@ -1,12 +1,12 @@
 """Qobuz module interface for Haberlea."""
 
-import asyncio
 import unicodedata
 from datetime import UTC, datetime
 from hashlib import md5
 from typing import Any
 
 import av
+from anyio.to_thread import run_sync
 from av import AudioFrame
 from av.audio.resampler import AudioResampler
 from av.packet import Packet
@@ -333,7 +333,7 @@ class ModuleInterface(ModuleBase):
         await download_file(url, target_path, session=self.api.session)
 
         # Add MD5 signature for FLAC files (runs in thread pool)
-        await asyncio.to_thread(self.add_flac_md5_signature, target_path)
+        await run_sync(self.add_flac_md5_signature, target_path)
 
         return TrackDownloadInfo(download_type=DownloadEnum.DIRECT)
 
