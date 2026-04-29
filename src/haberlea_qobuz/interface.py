@@ -1,9 +1,13 @@
 """Qobuz module interface for Haberlea."""
 
+import logging
+import re
 import unicodedata
 from datetime import UTC, datetime
 from hashlib import md5
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import av
 from anyio.to_thread import run_sync
@@ -12,7 +16,6 @@ from av.audio.resampler import AudioResampler
 from av.packet import Packet
 from mutagen.flac import FLAC
 from numpy import uint8
-from rich import print
 
 from haberlea.plugins.base import ModuleBase
 from haberlea.utils.models import (
@@ -23,6 +26,8 @@ from haberlea.utils.models import (
     CreditsInfo,
     DownloadEnum,
     DownloadTypeEnum,
+    ManualEnum,
+    MediaIdentification,
     ModuleController,
     ModuleInformation,
     ModuleModes,
@@ -35,15 +40,20 @@ from haberlea.utils.models import (
 )
 from haberlea.utils.utils import download_file
 
+from .autofill import parse_autofill_text
 from .qobuz_api import Qobuz
+from .results import ArtistExtraction
+
+logger = logging.getLogger(__name__)
 
 module_information = ModuleInformation(
     service_name="Qobuz",
     module_supported_modes=ModuleModes.download | ModuleModes.credits,
     global_settings={
+        "name": "",
+        "region": "",
         "app_id": "",
         "app_secret": "",
-        "quality_format": "{sample_rate}kHz {bit_depth}bit",
     },
     session_settings={"username": "", "password": ""},
     session_storage_variables=["token"],
@@ -55,7 +65,22 @@ module_information = ModuleInformation(
         "artist": DownloadTypeEnum.artist,
         "interpreter": DownloadTypeEnum.artist,
     },
+    url_decoding=ManualEnum.manual,
     test_url="https://open.qobuz.com/track/52151405",
+    account_autofill_parser=parse_autofill_text,
+)
+
+# Matches URLs like /us-en/album/..., extracting "us" as region
+_QOBUZ_URL_PATTERN = re.compile(
+    r"^/(?:(?P<region>[a-z]{2})-[a-z]{2}/)?"
+    r"(?P<media_type>track|album|playlist|artist|interpreter)"
+    r"/[^/]+/(?P<media_id>[a-z0-9]+)$"
+)
+
+# Matches open.qobuz.com URLs like /track/12345
+_QOBUZ_OPEN_URL_PATTERN = re.compile(
+    r"^/(?P<media_type>track|album|playlist|artist|interpreter)"
+    r"/(?P<media_id>[a-z0-9]+)$"
 )
 
 
@@ -90,7 +115,48 @@ class ModuleInterface(ModuleBase):
             QualityEnum.HIFI: 27,
         }
         self.quality_tier = module_controller.haberlea_options.quality_tier
-        self.quality_format: str | None = settings.get("quality_format")
+
+    def custom_url_parse(self, url: str) -> MediaIdentification | None:
+        """Parse a Qobuz URL, extracting media type, ID, and region.
+
+        Supports both ``open.qobuz.com`` and ``www.qobuz.com`` URL formats.
+        Region is extracted from the locale prefix (e.g., ``us`` from ``/us-en/``).
+
+        Args:
+            url: The Qobuz URL to parse.
+
+        Returns:
+            MediaIdentification with parsed info, or None if URL is invalid.
+        """
+        parsed = urlparse(url)
+        media_types: dict[str, DownloadTypeEnum] = {
+            "track": DownloadTypeEnum.track,
+            "album": DownloadTypeEnum.album,
+            "playlist": DownloadTypeEnum.playlist,
+            "artist": DownloadTypeEnum.artist,
+            "interpreter": DownloadTypeEnum.artist,
+        }
+
+        # Try www.qobuz.com format: /us-en/album/name/id
+        match = _QOBUZ_URL_PATTERN.match(parsed.path)
+        if match:
+            return MediaIdentification(
+                media_type=media_types[match.group("media_type")],
+                media_id=match.group("media_id"),
+                original_url=url,
+                url_region=match.group("region") or "",
+            )
+
+        # Try open.qobuz.com format: /track/12345
+        match = _QOBUZ_OPEN_URL_PATTERN.match(parsed.path)
+        if match:
+            return MediaIdentification(
+                media_type=media_types[match.group("media_type")],
+                media_id=match.group("media_id"),
+                original_url=url,
+            )
+
+        return None
 
     async def close(self) -> None:
         """Close the module and release resources.
@@ -113,7 +179,7 @@ class ModuleInterface(ModuleBase):
 
     def _extract_track_artists(
         self, track_data: dict, album_data: dict
-    ) -> tuple[list[str], dict]:
+    ) -> ArtistExtraction:
         """Extract and process artist information from track data.
 
         Args:
@@ -121,7 +187,7 @@ class ModuleInterface(ModuleBase):
             album_data: Album data dictionary.
 
         Returns:
-            Tuple of (artists list, modified track_data).
+            ArtistExtraction with artists list and modified track_data.
         """
         main_artist = track_data.get("performer", album_data["artist"])
         artists = [
@@ -149,7 +215,7 @@ class ModuleInterface(ModuleBase):
             track_data["performers"] = " - ".join(performers)
 
         artists[0] = main_artist["name"]
-        return artists, track_data
+        return ArtistExtraction(artists=artists, artist_data=track_data)
 
     def _build_qobuz_track_tags(self, track_data: dict, album_data: dict) -> Tags:
         """Build Tags object from track and album data.
@@ -271,7 +337,9 @@ class ModuleInterface(ModuleBase):
         quality_id: int = self.quality_parse[quality_tier]
 
         # Extract artists
-        artists, track_data = self._extract_track_artists(track_data, album_data)
+        extraction = self._extract_track_artists(track_data, album_data)
+        artists = extraction.artists
+        track_data = extraction.artist_data
 
         # Build tags
         tags = self._build_qobuz_track_tags(track_data, album_data)
@@ -315,7 +383,7 @@ class ModuleInterface(ModuleBase):
 
     async def get_track_download(
         self,
-        target_path: str,
+        target_path: Path,
         url: str = "",
         data: dict | None = None,  # noqa: ARG002
     ) -> TrackDownloadInfo:
@@ -337,7 +405,7 @@ class ModuleInterface(ModuleBase):
 
         return TrackDownloadInfo(download_type=DownloadEnum.DIRECT)
 
-    def add_flac_md5_signature(self, file_path: str) -> None:
+    def add_flac_md5_signature(self, file_path: Path) -> None:
         """Add MD5 signature to FLAC file if missing.
 
         This is called as a post-download hook by the downloader.
@@ -346,7 +414,7 @@ class ModuleInterface(ModuleBase):
             file_path: Path to the downloaded FLAC file.
         """
         try:
-            flac_file = FLAC(file_path)
+            flac_file = FLAC(str(file_path))
             if flac_file is None or flac_file.info.md5_signature != 0:
                 return
 
@@ -360,9 +428,9 @@ class ModuleInterface(ModuleBase):
 
         except Exception as e:
             # If it's not a FLAC file or MD5 calculation fails, continue without MD5
-            print(f"Failed to add FLAC MD5 signature: {e}")
+            logger.warning("Failed to add FLAC MD5 signature: %s", e)
 
-    def _calculate_flac_md5(self, flac_path: str, bit_depth: int) -> bytes:
+    def _calculate_flac_md5(self, flac_path: Path, bit_depth: int) -> bytes:
         """Calculate MD5 hash for FLAC file.
 
         Decodes the FLAC file to raw PCM samples and calculates the MD5 hash.
@@ -381,7 +449,7 @@ class ModuleInterface(ModuleBase):
         """
         md_5 = md5()
         try:
-            with av.open(flac_path) as container:
+            with av.open(str(flac_path)) as container:
                 audio_stream = None
                 for stream in container.streams:
                     if stream.type == "audio":
@@ -490,7 +558,7 @@ class ModuleInterface(ModuleBase):
             track["album"] = album_data
             extra_kwargs[track_id] = track
 
-        # get the wanted quality for an actual album quality_format string
+        # get the wanted quality for an actual album quality string
         quality_tier = self.quality_parse[self.quality_tier]
         # TODO: Ignore sample_rate and bit_depth if album_data['hires'] is False?
         bit_depth = 24 if quality_tier == 27 and album_data["hires_streamable"] else 16
@@ -500,8 +568,6 @@ class ModuleInterface(ModuleBase):
             else 44.1
         )
 
-        quality_tags = {"sample_rate": sample_rate, "bit_depth": bit_depth}
-
         # album title fix to include version tag
         album_title_raw = album_data.get("title") or ""
         album_name = album_title_raw.rstrip()
@@ -509,9 +575,7 @@ class ModuleInterface(ModuleBase):
             f" ({album_data.get('version')})" if album_data.get("version") else ""
         )
 
-        quality_str: str | None = None
-        if self.quality_format:
-            quality_str = self.quality_format.format(**quality_tags)
+        quality_str = f"{sample_rate}kHz {bit_depth}bit"
 
         return AlbumInfo(
             name=album_name,

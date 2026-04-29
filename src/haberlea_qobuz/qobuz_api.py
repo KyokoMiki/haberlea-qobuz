@@ -13,6 +13,8 @@ from haberlea.utils.exceptions import (
 )
 from haberlea.utils.utils import create_aiohttp_session, hash_string
 
+from .results import ApiSignature
+
 
 class Qobuz:
     """Qobuz API client.
@@ -141,8 +143,8 @@ class Qobuz:
             }
 
         signature = self._create_signature("user/login", params)
-        params["request_ts"] = signature[0]
-        params["request_sig"] = signature[1]
+        params["request_ts"] = signature.timestamp
+        params["request_sig"] = signature.signature
 
         r = await self._get("user/login", params)
 
@@ -155,7 +157,7 @@ class Qobuz:
 
         raise ModuleAuthError(module_name="qobuz")
 
-    def _create_signature(self, method: str, parameters: dict) -> tuple[str, str]:
+    def _create_signature(self, method: str, parameters: dict) -> ApiSignature:
         """Create API request signature.
 
         Args:
@@ -163,7 +165,7 @@ class Qobuz:
             parameters: Request parameters.
 
         Returns:
-            Tuple of (timestamp, signature).
+            ApiSignature with timestamp and signature.
         """
         timestamp = str(int(time.time()))
         to_hash = method.replace("/", "")
@@ -174,7 +176,7 @@ class Qobuz:
 
         to_hash += timestamp + self.app_secret
         signature = hash_string(to_hash, "MD5")
-        return timestamp, signature
+        return ApiSignature(signature=signature, timestamp=timestamp)
 
     async def search(self, query_type: str, query: str, limit: int = 10) -> dict:
         """Search for content.
@@ -217,8 +219,8 @@ class Qobuz:
         }
 
         signature = self._create_signature("track/getFileUrl", params)
-        params["request_ts"] = signature[0]
-        params["request_sig"] = signature[1]
+        params["request_ts"] = signature.timestamp
+        params["request_sig"] = signature.signature
 
         return await self._get("track/getFileUrl", params)
 
